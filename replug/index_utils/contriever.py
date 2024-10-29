@@ -3,12 +3,12 @@
 import os
 import torch
 import transformers
-from transformers import BertModel
+from transformers import AutoModel, AutoTokenizer
 
 from index_utils import utils
 
 
-class Contriever(BertModel):
+class Contriever(AutoModel):
 
     def __init__(self, config, pooling="average", **kwargs):
         super().__init__(config, add_pooling_layer=False)
@@ -74,7 +74,6 @@ def load_retriever(model_path):
                 "encoder_q.", ""): v for k, v in pretrained_dict.items() if "encoder_q" in k}
         retriever.load_state_dict(pretrained_dict)
     else:
-        cfg = utils.load_hf(transformers.AutoConfig, model_path)
-        tokenizer = utils.load_hf(transformers.AutoTokenizer, model_path)
-        retriever = utils.load_hf(Contriever, model_path)
+        tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-base-en-v1.5")
+        retriever = AutoModel.from_pretrained("BAAI/bge-base-en-v1.5")
     return retriever, tokenizer
