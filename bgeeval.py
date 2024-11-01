@@ -11,16 +11,6 @@ from sklearn.metrics import f1_score
 dev_set_path = '/local/scratch3/jnie29/REPLUG/v1.0_sample_nq-dev-sample.jsonl'
 dev_data = pd.read_json(dev_set_path, lines=True)
 
-# Load passages from TSV file
-psgs_file_path = '/local/scratch3/jnie29/REPLUG/psgs_w100_clean.tsv'
-dataset = []
-try:
-    # Load the TSV dataset
-    df = pd.read_csv(psgs_file_path, sep='\t')
-    grouped = df.groupby('title')['text'].apply(lambda texts: ' '.join(texts)).reset_index()
-    dataset = grouped.to_dict(orient='records')
-except FileNotFoundError:
-    print(f"File not found: {psgs_file_path}. Please check the file path.")
 
 # Load Contriever as the dense retriever encoder
 class ContrieverEncoder(torch.nn.Module):
