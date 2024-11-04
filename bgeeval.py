@@ -8,7 +8,7 @@ import os
 from sklearn.metrics import f1_score
 
 # Load the dev set
-dev_set_path = '/local/scratch3/jnie29/REPLUG/v1.0_sample_nq-dev-sample.jsonl'
+dev_set_path = '/Users/daisywang/Desktop/SparseMeetsDense/v1.0_sample_nq-dev-sample.jsonl'
 dev_data = pd.read_json(dev_set_path, lines=True)
 
 
@@ -39,7 +39,7 @@ contriever_encoder = ContrieverEncoder()
 t5_model = T5ForConditionalGeneration.from_pretrained("t5-base")
 
 # FAISS index to store passage embeddings
-index_file = "/local/scratch3/jnie29/REPLUG/faiss_index_bge"
+index_file = "/Users/daisywang/Desktop/SparseMeetsDense/faiss_index_bge"
 embedding_dim = 768
 passage_texts = []
 
@@ -94,30 +94,49 @@ def generate_answer(question):
     answer = contriever_encoder.question_tokenizer.decode(outputs[0], skip_special_tokens=True)
     return answer
 
-# Evaluate across the entire dev dataset
 def evaluate(dev_data, top_k=10):
     predictions = []
     references = []
 
     for i, row in dev_data.iterrows():
         question = row['question_text']
-        
-        # Extract the reference answer as a string or from token positions
+
+        # Extract the reference answer from annotations
         true_answer = ""
-        if row['annotations'] and 'short_answers' in row['annotations'][0] and row['annotations'][0]['short_answers']:
-            short_answer = row['annotations'][0]['short_answers'][0]
-            if 'text' in short_answer:
-                true_answer = short_answer['text']
-            elif 'start_token' in short_answer and 'end_token' in short_answer:
-                start = short_answer['start_token']
-                end = short_answer['end_token']
-                # Join tokens from start to end
-                document_tokens = row['document_tokens'][start:end]
-                true_answer = ' '.join([token['text'] for token in document_tokens if 'text' in token])
-        
+        if row['annotations']:
+            # Iterate over annotations to find short answers
+            for annotation in row['annotations']:
+                if 'short_answers' in annotation and annotation['short_answers']:
+                    # Handle cases with text or token positions
+                    short_answer_texts = []
+                    for short_answer in annotation['short_answers']:
+                        if 'text' in short_answer:
+                            short_answer_texts.append(short_answer['text'])
+                        elif 'start_token' in short_answer and 'end_token' in short_answer:
+                            start = short_answer['start_token']
+                            end = short_answer['end_token']
+                            # Extract tokens between start and end
+                            document_tokens = row['document_tokens'][start:end]
+                            extracted_text = ' '.join(
+                                [token['token'] for token in document_tokens if 'token' in token]
+                            )
+                            short_answer_texts.append(extracted_text)
+
+                    if short_answer_texts:
+                        true_answer = ', '.join(short_answer_texts)
+                        break  # Stop after finding the first valid annotation
+
         # Generate model prediction
         predicted_answer = generate_answer(question)
+
+        # Debugging prints
+        print(f"Question: {question}")
+        print(f"Predicted Answer: {predicted_answer}")
+        print(f"Reference Answer: {true_answer}")
         
+        if not true_answer:
+            continue  # Skip if no valid true answer is found
+
         # Append the prediction and reference for evaluation
         predictions.append(predicted_answer)
         references.append(true_answer)
