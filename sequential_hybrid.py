@@ -5,11 +5,11 @@ from nltk.tokenize import word_tokenize
 import nltk
 import torch
 
+# Download NLTK resources
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
-## first sparse then dense
-
-# Sample longer documents (corpus)
+# Sample documents (corpus)
 documents = [
     """The quick brown fox jumps over the lazy dog multiple times, showcasing its agility and 
        speed in a way that makes it a remarkable creature. Such animals are often seen in forests 
@@ -37,19 +37,20 @@ documents = [
        physical prowess and a keen understanding of the environment."""
 ]
 
-# bm25
+# Initialize BM25 with tokenized corpus
 tokenized_corpus = [word_tokenize(doc.lower()) for doc in documents]
 bm25 = BM25Okapi(tokenized_corpus)
 
+# Define query and tokenize it
 query = "fox agility and cunning nature"
 tokenized_query = word_tokenize(query.lower())
 
-# 1. retrieve initial set using BM25
+# Retrieve initial set using BM25
 bm25_scores = bm25.get_scores(tokenized_query)
 bm25_ranked = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)
 top_bm25_docs = [documents[idx] for idx, score in bm25_ranked[:3]]  # top k
 
-# 2:  dense retrieval
+# Dense retrieval setup
 model_name = "BAAI/bge-large-en-v1.5"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
@@ -64,12 +65,10 @@ def embed_text(text):
 # Embed query and top BM25 documents
 query_embedding = embed_text(query)
 bm25_doc_embeddings = torch.cat([embed_text(doc) for doc in top_bm25_docs])
-# print(bm25_doc_embeddings)
 
 # Compute cosine similarities for refined ranking
 cosine_scores = cosine_similarity(query_embedding, bm25_doc_embeddings).flatten()
 hybrid_ranked = sorted(enumerate(cosine_scores), key=lambda x: x[1], reverse=True)
-# print(hybrid_ranked)
 
 # Display results
 print("Hybrid Retrieval Results:")
