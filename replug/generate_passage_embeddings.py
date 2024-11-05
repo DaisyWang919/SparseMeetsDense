@@ -40,8 +40,8 @@ def embed_passages(args, passages, model, tokenizer):
                 text = index_utils.normalize_text.normalize(text)
             batch_text.append(text)
 
+            # Process the batch when the batch size is reached or it's the last item
             if len(batch_text) == args.per_gpu_batch_size or k == len(passages) - 1:
-
                 encoded_batch = tokenizer.batch_encode_plus(
                     batch_text,
                     return_tensors="pt",
@@ -50,21 +50,44 @@ def embed_passages(args, passages, model, tokenizer):
                     truncation=True,
                 )
 
-                encoded_batch = {k:v.cuda() for k, v in encoded_batch.items()}
-                embeddings = model(**encoded_batch)
+                # Send tensors to GPU, apply half() only to floating-point tensors
+                for key in encoded_batch:
+                    encoded_batch[key] = encoded_batch[key].cuda()
+                    if encoded_batch[key].dtype == torch.float32 and not args.no_fp16:
+                        encoded_batch[key] = encoded_batch[key].half()  # Convert to float16 only if it's a float tensor
 
-                embeddings = embeddings.cpu()
-                total += len(batch_ids)
-                allids.extend(batch_ids)
-                allembeddings.append(embeddings)
+                try:
+                    # Compute embeddings
+                    model_output = model(**encoded_batch)
+                    # CLS pooling (use only CLS token embeddings)
+                    embeddings = model_output[0][:, 0]
 
+                    total += len(batch_ids)
+                    allids.extend(batch_ids)
+                    allembeddings.append(embeddings.cpu())  # Move to CPU to save GPU memory
+
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"Out of memory at batch {k}. Reducing batch size and retrying.")
+                        args.per_gpu_batch_size = max(1, args.per_gpu_batch_size // 2)  # Reduce batch size
+                        batch_ids = []  # Reset batch
+                        batch_text = []  # Reset batch
+                        torch.cuda.empty_cache()
+                        continue  # Skip to the next iteration after clearing memory
+                    else:
+                        raise e  # Reraise if it's a different error
+
+                # Reset for the next batch
                 batch_text = []
                 batch_ids = []
-                if k % 100000 == 0 and k > 0:
-                    print('Encoded passages %d', total)
 
+                if k % 100000 == 0 and k > 0:
+                    print(f'Encoded passages {total}', flush=True)
+
+    # Concatenate embeddings and convert to numpy array
     allembeddings = torch.cat(allembeddings, dim=0).numpy()
     return allids, allembeddings
+
 
 
 def main(args):
