@@ -6,11 +6,15 @@ import re
 import faiss
 import os
 from sklearn.metrics import f1_score
+import sys
 
 # Load the dev set
-dev_set_path = '/Users/daisywang/Desktop/SparseMeetsDense/v1.0_sample_nq-dev-sample.jsonl'
+dev_set_path = '/local/scratch3/jnie29/REPLUG/v1.0_sample_nq-dev-sample.jsonl'
 dev_data = pd.read_json(dev_set_path, lines=True)
 
+# Load the grouped TSV file
+grouped_file_path = '/local/scratch3/jnie29/REPLUG/psgs_w100_grouped.tsv'
+grouped_df = pd.read_csv(grouped_file_path, sep='\t')
 
 # Load Contriever as the dense retriever encoder
 class ContrieverEncoder(torch.nn.Module):
@@ -35,65 +39,94 @@ class ContrieverEncoder(torch.nn.Module):
 
 contriever_encoder = ContrieverEncoder()
 
-# Load T5 model
-t5_model = T5ForConditionalGeneration.from_pretrained("t5-base")
+print('loading model')
+sys.stdout.flush()
+# Load T5 model and tokenizer specifically for T5
+t5_model = T5ForConditionalGeneration.from_pretrained("allenai/unifiedqa-t5-large")
+t5_tokenizer = AutoTokenizer.from_pretrained("allenai/unifiedqa-t5-large")
 
 # FAISS index to store passage embeddings
-index_file = "/Users/daisywang/Desktop/SparseMeetsDense/faiss_index_bge"
+index_file = "/local/scratch3/jnie29/REPLUG/faiss_index_bge"
 embedding_dim = 768
-passage_texts = []
 
 if os.path.exists(index_file):
     print("Loading existing FAISS index from file...")
     index = faiss.read_index(index_file)
 else:
     index = faiss.IndexFlatIP(embedding_dim)
-    passage_embeddings = []
-    for idx, passage in enumerate(dataset):
-        if 'text' in passage:
-            passage_text = passage['text'][:512]
-            passage_texts.append(passage_text)
-            embedding = contriever_encoder.encode_passages([passage_text]).detach().numpy()[0]
-            embedding = np.ascontiguousarray(embedding, dtype=np.float32)
-            passage_embeddings.append(embedding)
-            index.add(np.array([embedding]))
+    for idx, row in grouped_df.iterrows():
+        passage_text = row['text'][:512]  # Truncate text if needed
+        embedding = contriever_encoder.encode_passages([passage_text]).detach().numpy()[0]
+        embedding = np.ascontiguousarray(embedding, dtype=np.float32)
+        index.add(np.array([embedding]))
     faiss.write_index(index, index_file)
 
 # Custom retriever to find relevant passage using FAISS
-def custom_retriever(question, passage_texts, encoder, index, top_k=10):
+def custom_retriever(question, grouped_df, encoder, index, top_k=10):
+    # Encode the question to get the dense representation
     question_embedding = encoder.encode_question([question]).detach().numpy()
     question_embedding = np.ascontiguousarray(question_embedding, dtype=np.float32)
+
+    # Use FAISS to retrieve top-k passage indices based on similarity
     D, I = index.search(question_embedding, top_k)
-
+    
+    print(f"Indices Retrieved: {I}")
+    
     if len(I) == 0 or len(I[0]) == 0:
-        return "No relevant passage found."
+        return "No relevant passage found.", [], []
 
-    retrieved_passages = [passage_texts[i] for i in I[0] if i >= 0 and i < len(passage_texts)]
+    # Retrieve the top passages using the indices from the grouped DataFrame
+    retrieved_passages = []
+    retrieved_embeddings = []
+    
+    for i in I[0]:
+        if i >= 0 and i < len(grouped_df):
+            passage_text = grouped_df.iloc[i]['text']
+            retrieved_passages.append(passage_text)
+
+            # Cast `i` to int before passing it to `reconstruct()`
+            passage_embedding = index.reconstruct(int(i))
+            retrieved_embeddings.append(passage_embedding)
+
+    # Optional: Rank retrieved passages by keyword matching (for additional filtering)
     keywords = re.findall(r'\w+', question.lower())
     passage_scores = []
 
-    for passage in retrieved_passages:
+    for idx, passage in enumerate(retrieved_passages):
         keyword_count = sum(1 for word in keywords if word in passage.lower())
-        passage_scores.append((keyword_count, passage))
+        passage_scores.append((keyword_count, passage, retrieved_embeddings[idx]))
 
     # Sort passages by keyword count if there are any scores
     if passage_scores:
         passage_scores = sorted(passage_scores, key=lambda x: x[0], reverse=True)
-        return passage_scores[0][1] if passage_scores[0][0] > 0 else "No relevant passage found."
-    
-    return "No relevant passage found."
+        best_passage = passage_scores[0][1] if passage_scores[0][0] > 0 else "No relevant passage found."
+        best_embedding = passage_scores[0][2] if passage_scores[0][0] > 0 else None
+    else:
+        best_passage = "No relevant passage found."
+        best_embedding = None
+
+    # Return the best passage and embedding, as well as all retrieved passages and embeddings
+    return best_passage, best_embedding, retrieved_passages, retrieved_embeddings
 
 # Function to generate an answer for a question
 def generate_answer(question):
-    passage = custom_retriever(question, passage_texts, contriever_encoder, index)
-    input_text = f"Question: {question}\nContext: {passage}"
-    inputs = contriever_encoder.question_tokenizer(input_text, return_tensors="pt", truncation=True, padding=True, max_length=512)
-    if 'token_type_ids' in inputs:
-        del inputs['token_type_ids']
+    # Get the best passage, its embedding, and all retrieved passages with embeddings
+    best_passage, best_embedding, retrieved_passages, retrieved_embeddings = custom_retriever(
+        question, grouped_df, contriever_encoder, index
+    )
+    
+    print(f"\nQuestion: {question}")
+    print(f"Selected Passage: {best_passage}")
+    
+    # Generate answer using the best passage and the T5 tokenizer
+    input_text = f"question: {question} context: {best_passage}"
+    inputs = t5_tokenizer(input_text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    
     outputs = t5_model.generate(**inputs, num_return_sequences=1, num_beams=2, max_new_tokens=50)
-    answer = contriever_encoder.question_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
     return answer
 
+# Function to evaluate the performance across the dev dataset
 def evaluate(dev_data, top_k=10):
     predictions = []
     references = []
@@ -129,25 +162,22 @@ def evaluate(dev_data, top_k=10):
         # Generate model prediction
         predicted_answer = generate_answer(question)
 
-        # Debugging prints
         print(f"Question: {question}")
         print(f"Predicted Answer: {predicted_answer}")
         print(f"Reference Answer: {true_answer}")
-        
+        sys.stdout.flush()
         if not true_answer:
             continue  # Skip if no valid true answer is found
 
-        # Append the prediction and reference for evaluation
         predictions.append(predicted_answer)
         references.append(true_answer)
 
-        # Print progress every 100 questions
         if i % 100 == 0:
             print(f"Processed {i+1}/{len(dev_data)} questions.")
 
     return predictions, references
 
-# Token-based F1 metric calculation for QA tasks
+# Calculate the evaluation metrics
 def calculate_metrics(predictions, references):
     exact_matches = [1 if pred == ref else 0 for pred, ref in zip(predictions, references)]
     exact_match_score = np.mean(exact_matches)
