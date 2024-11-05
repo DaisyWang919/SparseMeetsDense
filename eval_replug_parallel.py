@@ -30,7 +30,8 @@ grouped_df = pd.read_csv(grouped_file_path, sep='\t')
 print("Grouped TSV file loaded.")
 
 corpus = grouped_df['text'].tolist()
-# Initialize BM25 with tokenized corpus
+
+# Initialize BM25 with the tokenized corpus
 print("Initializing BM25 with the corpus...")
 with open('tokenized_content.json', 'r') as f:
     tokenized_corpus = json.load(f)
@@ -66,14 +67,12 @@ t5_model = T5ForConditionalGeneration.from_pretrained("allenai/unifiedqa-t5-larg
 t5_tokenizer = AutoTokenizer.from_pretrained("allenai/unifiedqa-t5-large")
 print("T5 model loaded.")
 
-# FAISS with GPU support (if available)
-faiss_index = None
+# Load the existing FAISS index file
+index_file = "/local/scratch3/jnie29/REPLUG/faiss_index_bge"
 embedding_dim = 768
-if torch.cuda.is_available():
-    res = faiss.StandardGpuResources()  # Use GPU resources
-    faiss_index = faiss.GpuIndexFlatIP(res, embedding_dim)  # FAISS index on GPU
-else:
-    faiss_index = faiss.IndexFlatIP(embedding_dim)  # FAISS index on CPU
+
+faiss_index = faiss.read_index(index_file)
+print("FAISS index loaded successfully.")
 
 # Function to embed text for queries or documents
 def embed_text(text, encode_type="question"):
@@ -84,29 +83,51 @@ def embed_text(text, encode_type="question"):
     else:
         raise ValueError("encode_type must be 'question' or 'passage'")
 
-# Custom retriever to use FAISS and BM25
-def custom_retriever(question, top_k_sparse, top_k_dense):
+# Function to normalize scores to a 0-1 range
+def normalize_scores(scores):
+    min_score = np.min(scores)
+    max_score = np.max(scores)
+    return (scores - min_score) / (max_score - min_score) if max_score != min_score else scores
+
+# Custom hybrid retriever combining BM25 and dense retrieval using FAISS
+def custom_retriever(question, top_k=10, lambda_param=0.5):
+    # Step 1: Sparse retrieval using BM25
     tokenized_query = word_tokenize(question.lower())
     bm25_scores = bm25.get_scores(tokenized_query)
-    bm25_ranked = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)
-    top_bm25_indices = [idx for idx, _ in bm25_ranked[:top_k_sparse]]
-    top_docs = [corpus[idx] for idx in top_bm25_indices]
 
+    # Step 2: Dense retrieval using FAISS
     query_embedding = embed_text(question, encode_type="question").astype(np.float32)
-    doc_embeddings = embed_text(top_docs, encode_type="passage")
+    D, I = faiss_index.search(query_embedding, len(corpus))  # Search across all corpus entries
 
-    embedding_dim = doc_embeddings.shape[1]
-    faiss_index.add(doc_embeddings)
-    D, I = faiss_index.search(query_embedding, top_k_dense)
+    dense_scores = [D[0][i] for i in range(len(D[0]))]
+    dense_indices = [I[0][i] for i in range(len(I[0]))]
 
-    retrieved_passages = [top_docs[i] for i in I[0] if i < len(top_docs)]
-    best_passage = retrieved_passages[0] if retrieved_passages else "No relevant passage found."
+    # Normalize BM25 and dense scores
+    normalized_bm25_scores = normalize_scores(bm25_scores)
+    normalized_dense_scores = normalize_scores(dense_scores)
 
-    return best_passage
+    # Combine BM25 and dense scores using lambda weighting
+    combined_scores = []
+    for idx in range(len(normalized_bm25_scores)):
+        bm25_score = normalized_bm25_scores[idx]
+        if idx in dense_indices:
+            dense_score = normalized_dense_scores[dense_indices.index(idx)]
+        else:
+            dense_score = 0  # Assign a default value if not in dense retrieval
+
+        combined_score = lambda_param * bm25_score + (1 - lambda_param) * dense_score
+        combined_scores.append((idx, combined_score))
+
+    # Rank documents based on combined scores and return the top `k`
+    ranked_documents = sorted(combined_scores, key=lambda x: x[1], reverse=True)
+    top_docs = [corpus[idx] for idx, _ in ranked_documents[:top_k]]
+    
+    return top_docs
 
 # Function to generate an answer for a question using the retrieved passage
-def generate_answer(question, top_k_sparse, top_k_dense):
-    best_passage = custom_retriever(question, top_k_sparse, top_k_dense)
+def generate_answer(question, top_k=10, lambda_param=0.5):
+    top_passages = custom_retriever(question, top_k, lambda_param)
+    best_passage = top_passages[0] if top_passages else "No relevant passage found."
 
     # Generate answer using T5 with the question and the best passage as context
     input_text = f"question: {question} context: {best_passage}"
@@ -116,14 +137,14 @@ def generate_answer(question, top_k_sparse, top_k_dense):
     return answer
 
 # Function to evaluate the performance across the dev dataset
-def evaluate(dev_data, top_k_sparse=1000, top_k_dense=10):
+def evaluate(dev_data, top_k=10, lambda_param=0.5):
     predictions = []
     references = []
 
     for i, row in dev_data.iterrows():
         question = row['question_text']
         true_answer = ""
-        
+
         if row['annotations']:
             for annotation in row['annotations']:
                 if 'short_answers' in annotation and annotation['short_answers']:
@@ -146,8 +167,8 @@ def evaluate(dev_data, top_k_sparse=1000, top_k_dense=10):
 
         if not true_answer:
             continue
-        
-        predicted_answer = generate_answer(question, top_k_sparse, top_k_dense)
+
+        predicted_answer = generate_answer(question, top_k, lambda_param)
         predictions.append(predicted_answer)
         references.append(true_answer)
 
